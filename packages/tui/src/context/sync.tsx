@@ -143,9 +143,16 @@ export const {
 
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
+    const resolvingSessions = new Map<string, Promise<void>>()
     const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
     const sessionEventRevisions = new Map<string, number>()
+    const sessionStatusRevisions = new Map<string, number>()
+    const permissionRevisions = new Map<string, number>()
+    const questionRevisions = new Map<string, number>()
     let sessionEventRevision = 0
+    let sessionStatusRevision = 0
+    let permissionRevision = 0
+    let questionRevision = 0
     const touchMessage = (sessionID: string, messageID: string) => {
       hydratingSessions.get(sessionID)?.messages.add(messageID)
     }
@@ -192,12 +199,66 @@ export const {
       sessionEventRevisions.set(sessionID, sessionEventRevision)
     }
 
+    function markSessionStatusEvent(sessionID: string) {
+      sessionStatusRevision++
+      sessionStatusRevisions.set(sessionID, sessionStatusRevision)
+    }
+
+    function markPermissionEvent(sessionID: string) {
+      permissionRevision++
+      permissionRevisions.set(sessionID, permissionRevision)
+    }
+
+    function markQuestionEvent(sessionID: string) {
+      questionRevision++
+      questionRevisions.set(sessionID, questionRevision)
+    }
+
+    function rememberSession(session: Session) {
+      markSessionEvent(session.id)
+      const result = search(store.session, session.id, (item) => item.id)
+      if (result.found) {
+        setStore("session", result.index, reconcile(session))
+        return
+      }
+      setStore(
+        "session",
+        produce((draft) => {
+          draft.splice(result.index, 0, session)
+        }),
+      )
+    }
+
+    function resolveSession(sessionID: string, location?: { directory?: string; workspace?: string }) {
+      if (search(store.session, sessionID, (session) => session.id).found) return Promise.resolve()
+      const active = resolvingSessions.get(sessionID)
+      if (active) return active
+      const revision = sessionEventRevisions.get(sessionID)
+      const task = sdk.client.session
+        .get({ sessionID, ...location }, { throwOnError: true })
+        .then((response) => {
+          if (!response.data) return
+          if (sessionEventRevisions.get(sessionID) !== revision) return
+          rememberSession(response.data)
+          if (response.data.parentID) {
+            void resolveSession(response.data.parentID, {
+              directory: response.data.directory,
+              workspace: response.data.workspaceID,
+            }).catch(() => {})
+          }
+        })
+        .finally(() => resolvingSessions.delete(sessionID))
+      resolvingSessions.set(sessionID, task)
+      return task
+    }
+
     event.subscribe((event, { directory, workspace }) => {
       switch (event.type) {
         case "server.instance.disposed":
           void bootstrap()
           break
         case "permission.replied": {
+          markPermissionEvent(event.properties.sessionID)
           const requests = store.permission[event.properties.sessionID]
           if (!requests) break
           const match = search(requests, event.properties.requestID, (r) => r.id)
@@ -214,6 +275,8 @@ export const {
 
         case "permission.asked": {
           const request = event.properties
+          markPermissionEvent(request.sessionID)
+          void resolveSession(request.sessionID, { directory, workspace }).catch(() => {})
           if (permission.mode === "auto") {
             void sdk.client.permission.reply({
               requestID: request.id,
@@ -245,6 +308,7 @@ export const {
 
         case "question.replied":
         case "question.rejected": {
+          markQuestionEvent(event.properties.sessionID)
           const requests = store.question[event.properties.sessionID]
           if (!requests) break
           const match = search(requests, event.properties.requestID, (r) => r.id)
@@ -261,6 +325,8 @@ export const {
 
         case "question.asked": {
           const request = event.properties
+          markQuestionEvent(request.sessionID)
+          void resolveSession(request.sessionID, { directory, workspace }).catch(() => {})
           const requests = store.question[request.sessionID]
           if (!requests) {
             setStore("question", request.sessionID, [request])
@@ -304,18 +370,7 @@ export const {
         }
         case "session.created":
         case "session.updated": {
-          markSessionEvent(event.properties.info.id)
-          const result = search(store.session, event.properties.info.id, (s) => s.id)
-          if (result.found) {
-            setStore("session", result.index, reconcile(event.properties.info))
-            break
-          }
-          setStore(
-            "session",
-            produce((draft) => {
-              draft.splice(result.index, 0, event.properties.info)
-            }),
-          )
+          rememberSession(event.properties.info)
           break
         }
 
@@ -337,7 +392,9 @@ export const {
         }
 
         case "session.status": {
+          markSessionStatusEvent(event.properties.sessionID)
           setStore("session_status", event.properties.sessionID, event.properties.status)
+          void resolveSession(event.properties.sessionID, { directory, workspace }).catch(() => {})
           break
         }
 
@@ -471,6 +528,63 @@ export const {
     const exit = useExit()
     const args = useArgs()
 
+    async function loadSessionStatuses(workspace: string | undefined) {
+      const revisions = new Map(sessionStatusRevisions)
+      const response = await sdk.client.session.status({ workspace })
+      for (const sessionID of Object.keys(response.data ?? {})) void resolveSession(sessionID, { workspace }).catch(() => {})
+      setStore(
+        "session_status",
+        produce((draft) => {
+          for (const [sessionID, status] of Object.entries(response.data ?? {})) {
+            if (sessionStatusRevisions.get(sessionID) !== revisions.get(sessionID)) continue
+            draft[sessionID] = status
+          }
+        }),
+      )
+    }
+
+    async function loadPermissions(workspace: string | undefined) {
+      const revisions = new Map(permissionRevisions)
+      const response = await sdk.client.permission.list({ workspace })
+      for (const request of response.data ?? []) void resolveSession(request.sessionID, { workspace }).catch(() => {})
+      const pending = (response.data ?? []).reduce<Record<string, PermissionRequest[]>>((result, request) => {
+        const requests = result[request.sessionID] ?? []
+        requests.push(request)
+        result[request.sessionID] = requests
+        return result
+      }, {})
+      setStore(
+        "permission",
+        produce((draft) => {
+          for (const sessionID of new Set([...Object.keys(draft), ...Object.keys(pending)])) {
+            if (permissionRevisions.get(sessionID) !== revisions.get(sessionID)) continue
+            draft[sessionID] = pending[sessionID] ?? []
+          }
+        }),
+      )
+    }
+
+    async function loadQuestions(workspace: string | undefined) {
+      const revisions = new Map(questionRevisions)
+      const response = await sdk.client.question.list({ workspace })
+      for (const request of response.data ?? []) void resolveSession(request.sessionID, { workspace }).catch(() => {})
+      const pending = (response.data ?? []).reduce<Record<string, QuestionRequest[]>>((result, request) => {
+        const requests = result[request.sessionID] ?? []
+        requests.push(request)
+        result[request.sessionID] = requests
+        return result
+      }, {})
+      setStore(
+        "question",
+        produce((draft) => {
+          for (const sessionID of new Set([...Object.keys(draft), ...Object.keys(pending)])) {
+            if (questionRevisions.get(sessionID) !== revisions.get(sessionID)) continue
+            draft[sessionID] = pending[sessionID] ?? []
+          }
+        }),
+      )
+    }
+
     async function bootstrap(input: { fatal?: boolean } = {}) {
       const fatal = input.fatal ?? true
       const workspace = project.workspace.current()
@@ -550,9 +664,9 @@ export const {
               .list({ workspace })
               .then((x) => setStore("mcp_resource", reconcile(x.data ?? {}))),
             sdk.client.formatter.status({ workspace }).then((x) => setStore("formatter", reconcile(x.data ?? []))),
-            sdk.client.session.status({ workspace }).then((x) => {
-              setStore("session_status", reconcile(x.data ?? {}))
-            }),
+            loadSessionStatuses(workspace),
+            loadPermissions(workspace),
+            loadQuestions(workspace),
             sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))),
             sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))),
             project.workspace.sync(),
