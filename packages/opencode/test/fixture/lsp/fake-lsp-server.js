@@ -6,6 +6,10 @@ let lastChange = null
 let initializeParams = null
 let diagnosticRequestCount = 0
 let registeredCapability = false
+const fs = require("fs")
+const shutdownMode = process.env.OPENCODE_TEST_LSP_SHUTDOWN
+const eventFile = process.env.OPENCODE_TEST_LSP_EVENT_FILE
+const shutdownReleaseFile = process.env.OPENCODE_TEST_LSP_SHUTDOWN_RELEASE_FILE
 const pendingClientRequests = new Map()
 let pullConfig = {
   delayMs: 0,
@@ -58,6 +62,13 @@ function sendResponse(id, result) {
 function sendNotification(method, params) {
   send({ jsonrpc: "2.0", method, params })
 }
+
+function record(event) {
+  if (!eventFile) return
+  fs.appendFileSync(eventFile, `${event}\n`)
+}
+
+if (shutdownMode === "unresponsive") setInterval(() => {}, 1_000)
 
 function maybeRegister(method) {
   if (pullConfig.registerOn !== method || registeredCapability) return
@@ -121,6 +132,31 @@ function handle(raw) {
       },
     })
     return
+  }
+
+  if (data.method === "shutdown") {
+    record("shutdown")
+    if (shutdownMode === "unresponsive") return
+    const response = () => {
+      sendResponse(data.id, null)
+      record("shutdown-response")
+    }
+    if (shutdownReleaseFile) {
+      const timer = setInterval(() => {
+        if (!fs.existsSync(shutdownReleaseFile)) return
+        clearInterval(timer)
+        response()
+      }, 10)
+      return
+    }
+    response()
+    return
+  }
+
+  if (data.method === "exit") {
+    record("exit")
+    if (shutdownMode === "unresponsive") return
+    process.exit(0)
   }
 
   if (data.method === "test/get-initialize-params") {
