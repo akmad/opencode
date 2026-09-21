@@ -395,6 +395,10 @@ jobs:
 
           foreach ($output in $unpacked) {
             $files += Get-ChildItem -LiteralPath $output.FullName -File | Where-Object Extension -ieq ".exe" | Select-Object -ExpandProperty FullName
+            $cli = Join-Path $output.FullName "resources\opencode-cli.exe"
+            if (Test-Path -LiteralPath $cli -PathType Leaf) {
+              $files += (Get-Item -LiteralPath $cli).FullName
+            }
             $helper = Join-Path $output.FullName "resources\opencode-process-win32.exe"
             if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
               throw "Expected Desktop helper was not found: ${helper}"
