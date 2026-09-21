@@ -385,21 +385,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $dist = "${{ github.workspace }}\packages\desktop\dist"
           $files = @()
-          $files += Get-ChildItem "${{ github.workspace }}\packages\desktop\dist\*.exe" | Select-Object -ExpandProperty FullName
-          $files += Get-ChildItem "${{ github.workspace }}\packages\desktop\dist\*unpacked\*.exe" | Select-Object -ExpandProperty FullName
-          $files += Get-ChildItem "${{ github.workspace }}\packages\desktop\dist\*unpacked\resources\opencode-cli.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-
-          $unpacked = @(Get-ChildItem "${{ github.workspace }}\packages\desktop\dist" -Directory -Filter "*unpacked")
+          $files += Get-ChildItem -LiteralPath $dist -File | Where-Object Extension -ieq ".exe" | Select-Object -ExpandProperty FullName
+          $unpacked = @(Get-ChildItem -LiteralPath $dist -Directory | Where-Object { $_.Name -like "*unpacked" })
           if ($unpacked.Count -eq 0) {
-            throw "No unpacked Windows Electron artifact found"
+            throw "No unpacked Windows Desktop output was found"
           }
-          foreach ($directory in $unpacked) {
-            $helper = Join-Path $directory.FullName "resources\opencode-process-win32.exe"
-            if (!(Test-Path $helper)) {
-              throw "Missing Windows process helper: $helper"
+
+          foreach ($output in $unpacked) {
+            $files += Get-ChildItem -LiteralPath $output.FullName -File | Where-Object Extension -ieq ".exe" | Select-Object -ExpandProperty FullName
+            $helper = Join-Path $output.FullName "resources\opencode-process-win32.exe"
+            if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+              throw "Expected Desktop helper was not found: ${helper}"
             }
-            $files += $helper
+            $files += (Get-Item -LiteralPath $helper).FullName
           }
 
           foreach ($file in $files | Select-Object -Unique) {
