@@ -8,7 +8,8 @@ import * as LSPServer from "./server"
 import { Config } from "@/config/config"
 import { Process } from "@/util/process"
 import { spawn as lspspawn } from "./launch"
-import { Effect, Layer, Context, Schema } from "effect"
+import { Duration, Effect, Layer, Context, Schema, Schedule } from "effect"
+import fs from "node:fs/promises"
 import { InstanceState } from "@/effect/instance-state"
 import { containsPath } from "@/project/instance-context"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
@@ -112,8 +113,10 @@ type LocInput = { file: string; line: number; character: number }
 interface State {
   clients: LSPClient.Info[]
   servers: Record<string, LSPServer.Info>
-  broken: Set<string>
-  spawning: Map<string, Attempt>
+  roots: Map<string, RootRecord>
+  retiring: Set<Promise<void>>
+  cleanupFailures: unknown[]
+  report: (message: string, error: unknown) => void
   disposed: boolean
 }
 
@@ -121,9 +124,161 @@ interface Attempt {
   promise?: Promise<LSPClient.Info | undefined>
   handle?: LSPServer.Handle
   retired: boolean
+  cancelled: Promise<void>
+  cancel: () => void
+  record: RootRecord
+  identity: RootIdentity
+}
+
+interface RootRecord {
+  key: string
+  root: string
+  server: LSPServer.Info
+  identity: RootIdentity
+  broken: boolean
+  stale: boolean
+  attempt?: Attempt
+  client?: LSPClient.Info
+  clientAttempt?: Attempt
+  retirement?: Promise<void>
+}
+
+interface RootIdentity {
+  device: string
+  inode: string
+  type: "directory" | "other"
+  birthtimeNs?: string
+  stable: boolean
 }
 
 const keyFor = (root: string, server: LSPServer.Info) => JSON.stringify([root, server.id])
+
+const rootChanged = (left: RootIdentity, right: RootIdentity) => {
+  if (left.type !== right.type) return true
+  if (!left.stable || !right.stable) return false
+  return left.device !== right.device || left.inode !== right.inode || left.birthtimeNs !== right.birthtimeNs
+}
+
+async function rootIdentity(root: string) {
+  try {
+    const stat = await fs.stat(root, { bigint: true })
+    const device = String(stat.dev)
+    const inode = String(stat.ino)
+    const birthtimeNs = stat.birthtimeNs === 0n ? undefined : String(stat.birthtimeNs)
+    return {
+      _tag: "present" as const,
+      identity: {
+        device,
+        inode,
+        type: stat.isDirectory() ? ("directory" as const) : ("other" as const),
+        birthtimeNs,
+        stable: stat.dev !== 0n && stat.ino !== 0n,
+      },
+    }
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error &&
+      "code" in error &&
+      (error.code === "ENOENT" || error.code === "ENOTDIR")
+    ) {
+      return { _tag: "missing" as const }
+    }
+    return { _tag: "uncertain" as const }
+  }
+}
+
+const current = (state: State, record: RootRecord, attempt: Attempt) =>
+  !state.disposed &&
+  !record.stale &&
+  !attempt.retired &&
+  state.roots.get(record.key) === record &&
+  record.attempt === attempt &&
+  record.identity === attempt.identity
+
+const currentClient = (state: State, record: RootRecord, attempt: Attempt, client: LSPClient.Info) =>
+  !state.disposed &&
+  !record.stale &&
+  state.roots.get(record.key) === record &&
+  record.identity === attempt.identity &&
+  record.client === client &&
+  record.clientAttempt === attempt
+
+function reportCleanupFailure(state: State, message: string, error: unknown) {
+  if (state.disposed) {
+    state.report(message, error)
+    return
+  }
+  state.cleanupFailures.push(error)
+}
+
+function retire(state: State, record: RootRecord) {
+  if (record.retirement) return record.retirement
+  record.stale = true
+  if (state.roots.get(record.key) === record) state.roots.delete(record.key)
+
+  const attempt = record.attempt
+  if (attempt && attempt.record === record) {
+    attempt.retired = true
+    attempt.cancel()
+    if (record.attempt === attempt) record.attempt = undefined
+    attempt.handle?.process.stdin?.destroy()
+    attempt.handle?.process.stdout?.destroy()
+    attempt.handle?.process.stderr?.destroy()
+  }
+
+  const client = record.client
+  if (client && record.client === client) {
+    record.client = undefined
+    record.clientAttempt = undefined
+    const index = state.clients.indexOf(client)
+    if (index !== -1) state.clients.splice(index, 1)
+  }
+
+  const cleanup = Promise.allSettled([
+    ...(attempt?.promise ? [attempt.promise] : []),
+    ...(attempt?.handle ? [Process.stop(attempt.handle.process)] : []),
+    ...(client ? [client.shutdown()] : []),
+  ]).then((results) => {
+    const failures = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []))
+    if (failures.length) throw new AggregateError(failures, `Failed to retire LSP root ${record.root}`)
+  })
+  record.retirement = cleanup
+  state.retiring.add(cleanup)
+  void cleanup.then(
+    () => state.retiring.delete(cleanup),
+    (error) => {
+      state.retiring.delete(cleanup)
+      reportCleanupFailure(state, "LSP root cleanup failed after disposal", error)
+    },
+  )
+  return cleanup
+}
+
+async function waitForRetirements(state: State, remaining: Promise<void>[] = []) {
+  const retirements = [...state.retiring]
+  const results = await Promise.allSettled([...retirements, ...remaining])
+  const failures = [
+    ...state.cleanupFailures.splice(0),
+    ...results.slice(retirements.length).flatMap((result) => (result.status === "rejected" ? [result.reason] : [])),
+  ]
+  if (failures.length) throw new AggregateError(failures, "Failed to retire LSP roots")
+}
+
+async function reconcileRoots(state: State) {
+  let updated = false
+  for (const record of [...state.roots.values()]) {
+    if (state.disposed) return updated
+    const observed = await rootIdentity(record.root)
+    if (state.roots.get(record.key) !== record) continue
+    if (observed._tag === "uncertain") continue
+    if (observed._tag === "present" && !rootChanged(record.identity, observed.identity)) continue
+    retire(state, record)
+    updated = true
+  }
+  await waitForRetirements(state)
+  return updated
+}
 
 export interface Interface {
   readonly init: () => Effect.Effect<void>
@@ -200,24 +355,33 @@ const layer = Layer.effect(
         const s: State = {
           clients: [],
           servers,
-          broken: new Set(),
-          spawning: new Map(),
+          roots: new Map(),
+          retiring: new Set(),
+          cleanupFailures: [],
+          report: (message, error) => Effect.runFork(Effect.logError(message, { cause: error })),
           disposed: false,
         }
 
         yield* Effect.addFinalizer(() =>
           Effect.promise(async () => {
             s.disposed = true
-            const attempts = [...s.spawning.values()]
-            for (const attempt of attempts) attempt.retired = true
-            s.spawning.clear()
-            await Promise.allSettled([
-              ...attempts.flatMap((attempt) =>
-                attempt.handle ? [Process.stop(attempt.handle.process).catch(() => undefined)] : [],
-              ),
-              ...s.clients.map((client) => client.shutdown().catch(() => undefined)),
-            ])
-          }),
+            for (const record of [...s.roots.values()]) retire(s, record)
+            const clients = s.clients.splice(0)
+            await waitForRetirements(
+              s,
+              clients.map((client) => client.shutdown()),
+            )
+          }).pipe(Effect.catchCause((cause) => Effect.logError("LSP root cleanup failed", { cause }))),
+        )
+
+        yield* Effect.gen(function* () {
+          const updated = yield* Effect.promise(() => reconcileRoots(s))
+          if (updated && !s.disposed) yield* events.publish(Event.Updated, {})
+        }).pipe(
+          Effect.catchCause((cause) => Effect.logError("LSP root reconciliation failed", { cause })),
+          Effect.repeat(Schedule.spaced(Duration.millis(250))),
+          Effect.delay(Duration.millis(250)),
+          Effect.forkScoped,
         )
 
         return s
@@ -230,61 +394,77 @@ const layer = Layer.effect(
       const s = yield* InstanceState.get(state)
       if (s.disposed) return [] as LSPClient.Info[]
       const clients = yield* Effect.promise(async () => {
-        const empty = { result: [] as LSPClient.Info[], updated: [] as Attempt[] }
+        const empty = { result: [] as LSPClient.Info[], updated: false }
         if (s.disposed) return empty
         const extension = path.parse(file).ext || file
         const result: LSPClient.Info[] = []
-        const updated: Attempt[] = []
+        let updated = false
 
-        const current = (attempt: Attempt, key: string) =>
-          !s.disposed && !attempt.retired && s.spawning.get(key) === attempt
-
-        async function schedule(server: LSPServer.Info, root: string, key: string, attempt: Attempt) {
+        async function schedule(record: RootRecord, attempt: Attempt) {
+          const spawning = record.server.spawn(record.root, ctx, flags)
           let handle: LSPServer.Handle | undefined
           try {
-            handle = await server.spawn(root, ctx, flags)
+            handle = await Promise.race([spawning, attempt.cancelled.then(() => undefined)])
           } catch {
-            if (current(attempt, key)) s.broken.add(key)
+            if (current(s, record, attempt)) record.broken = true
             return undefined
           }
 
-          if (!current(attempt, key)) {
-            if (handle) await Process.stop(handle.process).catch(() => undefined)
+          if (!handle) {
+            if (!attempt.retired) {
+              record.broken = true
+              return undefined
+            }
+            void spawning.then(
+              (late) => {
+                if (!late) return
+                return Process.stop(late.process).catch((error) =>
+                  reportCleanupFailure(s, "LSP spawn cleanup failed", error),
+                )
+              },
+              () => undefined,
+            )
             return undefined
           }
-          if (!handle) {
-            s.broken.add(key)
+
+          if (!current(s, record, attempt)) {
+            await Process.stop(handle.process)
             return undefined
           }
 
           attempt.handle = handle
-          let client: LSPClient.Info
+          const creating = LSPClient.create({
+            serverID: record.server.id,
+            server: handle,
+            root: record.root,
+            directory: ctx.directory,
+            instance: ctx,
+          })
+          let client: LSPClient.Info | undefined
           try {
-            client = await LSPClient.create({
-              serverID: server.id,
-              server: handle,
-              root,
-              directory: ctx.directory,
-              instance: ctx,
-            })
+            client = await Promise.race([creating, attempt.cancelled.then(() => undefined)])
           } catch {
-            if (current(attempt, key)) s.broken.add(key)
-            await Process.stop(handle.process).catch(() => undefined)
+            if (current(s, record, attempt)) record.broken = true
+            await Process.stop(handle.process)
+            return undefined
+          }
+          if (!client) {
+            void creating.then(
+              (late) => late.shutdown().catch((error) => reportCleanupFailure(s, "LSP client cleanup failed", error)),
+              () => undefined,
+            )
             return undefined
           }
 
-          if (!current(attempt, key)) {
-            await client.shutdown().catch(() => undefined)
+          if (!current(s, record, attempt)) {
+            await client.shutdown()
             return undefined
           }
 
-          const existing = s.clients.find((x) => x.root === root && x.serverID === server.id)
-          if (existing) {
-            await client.shutdown().catch(() => undefined)
-            return current(attempt, key) ? existing : undefined
-          }
-
+          record.client = client
+          record.clientAttempt = attempt
           attempt.handle = undefined
+          record.attempt = undefined
           s.clients.push(client)
           return client
         }
@@ -292,59 +472,101 @@ const layer = Layer.effect(
         for (const server of Object.values(s.servers)) {
           if (server.extensions.length && !server.extensions.includes(extension)) continue
 
-          const root = await server.root(file, ctx)
-          if (s.disposed) return empty
-          if (!root) continue
-          const key = keyFor(root, server)
-          if (s.broken.has(key)) continue
-
-          if (s.disposed) return empty
-          const match = s.clients.find((x) => x.root === root && x.serverID === server.id)
-          if (match) {
+          for (let retry = 0; retry < 3; retry++) {
+            const root = await server.root(file, ctx)
             if (s.disposed) return empty
-            result.push(match)
-            continue
-          }
-
-          const inflight = s.spawning.get(key)
-          if (inflight) {
-            const client = await inflight.promise
+            if (!root) break
+            const key = keyFor(root, server)
+            const snapshot = s.roots.get(key)
+            const observed = await rootIdentity(root)
             if (s.disposed) return empty
-            if (!client) continue
-            result.push(client)
-            continue
-          }
+            if (s.roots.get(key) !== snapshot) continue
 
-          if (s.disposed) return empty
-          const attempt: Attempt = { retired: false }
-          s.spawning.set(key, attempt)
-          const task = schedule(server, root, key, attempt)
-          attempt.promise = task
-
-          task.finally(() => {
-            if (s.spawning.get(key) === attempt) {
-              s.spawning.delete(key)
+            let record = snapshot
+            if (
+              record &&
+              (observed._tag === "missing" ||
+                (observed._tag === "present" && rootChanged(record.identity, observed.identity)))
+            ) {
+              retire(s, record)
+              updated = true
             }
-          })
+            record = s.roots.get(key)
+            if (!record) {
+              if (observed._tag !== "present") break
+              const replacement: RootRecord = {
+                key,
+                root,
+                server,
+                identity: observed.identity,
+                broken: false,
+                stale: false,
+              }
+              if (!s.roots.has(key)) s.roots.set(key, replacement)
+              record = s.roots.get(key)
+            }
+            if (!record || record.broken) break
 
-          const client = await task
-          if (s.disposed) return empty
-          if (!client) continue
+            if (record.client) {
+              result.push(record.client)
+              break
+            }
 
-          result.push(client)
-          updated.push(attempt)
+            if (record.attempt) {
+              const attempt = record.attempt
+              const client = await attempt.promise
+              if (s.disposed) return empty
+              if (!client) {
+                if (current(s, record, attempt) && record.broken) break
+                continue
+              }
+              if (!currentClient(s, record, attempt, client)) continue
+              result.push(client)
+              break
+            }
+
+            if (s.disposed) return empty
+            let cancel!: () => void
+            const attempt: Attempt = {
+              retired: false,
+              cancelled: new Promise<void>((resolve) => {
+                cancel = resolve
+              }),
+              cancel: () => cancel(),
+              record,
+              identity: record.identity,
+            }
+            record.attempt = attempt
+            const task = schedule(record, attempt)
+            attempt.promise = task
+
+            void task.then(
+              () => {
+                if (record.attempt === attempt) record.attempt = undefined
+              },
+              (error) => {
+                if (record.attempt === attempt) record.attempt = undefined
+                reportCleanupFailure(s, "LSP root attempt cleanup failed after disposal", error)
+              },
+            )
+
+            const client = await task
+            if (s.disposed) return empty
+            if (!client) {
+              if (current(s, record, attempt) && record.broken) break
+              continue
+            }
+            if (!currentClient(s, record, attempt, client)) continue
+            result.push(client)
+            updated = true
+            break
+          }
         }
 
         return { result, updated }
       })
       if (s.disposed) return []
-      yield* Effect.forEach(
-        clients.updated,
-        (attempt) => (s.disposed || attempt.retired ? Effect.void : events.publish(Event.Updated, {})),
-        {
-          discard: true,
-        },
-      )
+      yield* clients.updated ? events.publish(Event.Updated, {}) : Effect.void
       if (s.disposed) return []
       return clients.result
     })
@@ -390,7 +612,7 @@ const layer = Layer.effect(
           const root = await server.root(file, ctx)
           if (s.disposed) return false
           if (!root) continue
-          if (s.broken.has(keyFor(root, server))) continue
+          if (s.roots.get(keyFor(root, server))?.broken) continue
           return true
         }
         return false
