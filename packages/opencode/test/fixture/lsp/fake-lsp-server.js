@@ -10,6 +10,9 @@ const fs = require("fs")
 const shutdownMode = process.env.OPENCODE_TEST_LSP_SHUTDOWN
 const eventFile = process.env.OPENCODE_TEST_LSP_EVENT_FILE
 const shutdownReleaseFile = process.env.OPENCODE_TEST_LSP_SHUTDOWN_RELEASE_FILE
+const initializeReleaseFile = process.env.OPENCODE_TEST_LSP_INITIALIZE_RELEASE_FILE
+const recordInitialize = process.env.OPENCODE_TEST_LSP_RECORD_INITIALIZE
+const recordStart = process.env.OPENCODE_TEST_LSP_RECORD_START
 const pendingClientRequests = new Map()
 let pullConfig = {
   delayMs: 0,
@@ -68,6 +71,8 @@ function record(event) {
   fs.appendFileSync(eventFile, `${event}\n`)
 }
 
+if (recordStart) record("start")
+
 if (shutdownMode === "unresponsive") setInterval(() => {}, 1_000)
 
 function maybeRegister(method) {
@@ -124,13 +129,24 @@ function handle(raw) {
 
   if (data.method === "initialize") {
     initializeParams = data.params
-    sendResponse(data.id, {
-      capabilities: {
-        textDocumentSync: {
-          change: 2,
+    if (recordInitialize) record("initialize")
+    const response = () =>
+      sendResponse(data.id, {
+        capabilities: {
+          textDocumentSync: {
+            change: 2,
+          },
         },
-      },
-    })
+      })
+    if (!initializeReleaseFile) {
+      response()
+      return
+    }
+    const timer = setInterval(() => {
+      if (!fs.existsSync(initializeReleaseFile)) return
+      clearInterval(timer)
+      response()
+    }, 10)
     return
   }
 
