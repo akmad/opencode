@@ -113,8 +113,17 @@ interface State {
   clients: LSPClient.Info[]
   servers: Record<string, LSPServer.Info>
   broken: Set<string>
-  spawning: Map<string, Promise<LSPClient.Info | undefined>>
+  spawning: Map<string, Attempt>
+  disposed: boolean
 }
+
+interface Attempt {
+  promise?: Promise<LSPClient.Info | undefined>
+  handle?: LSPServer.Handle
+  retired: boolean
+}
+
+const keyFor = (root: string, server: LSPServer.Info) => JSON.stringify([root, server.id])
 
 export interface Interface {
   readonly init: () => Effect.Effect<void>
@@ -193,11 +202,21 @@ const layer = Layer.effect(
           servers,
           broken: new Set(),
           spawning: new Map(),
+          disposed: false,
         }
 
         yield* Effect.addFinalizer(() =>
           Effect.promise(async () => {
-            await Promise.all(s.clients.map((client) => client.shutdown()))
+            s.disposed = true
+            const attempts = [...s.spawning.values()]
+            for (const attempt of attempts) attempt.retired = true
+            s.spawning.clear()
+            await Promise.allSettled([
+              ...attempts.flatMap((attempt) =>
+                attempt.handle ? [Process.stop(attempt.handle.process).catch(() => undefined)] : [],
+              ),
+              ...s.clients.map((client) => client.shutdown().catch(() => undefined)),
+            ])
           }),
         )
 
@@ -209,44 +228,63 @@ const layer = Layer.effect(
       const ctx = yield* InstanceState.context
       if (!containsPath(file, ctx)) return [] as LSPClient.Info[]
       const s = yield* InstanceState.get(state)
+      if (s.disposed) return [] as LSPClient.Info[]
       const clients = yield* Effect.promise(async () => {
+        const empty = { result: [] as LSPClient.Info[], updated: [] as Attempt[] }
+        if (s.disposed) return empty
         const extension = path.parse(file).ext || file
         const result: LSPClient.Info[] = []
-        let updated = 0
+        const updated: Attempt[] = []
 
-        async function schedule(server: LSPServer.Info, root: string, key: string) {
-          const handle = await server
-            .spawn(root, ctx, flags)
-            .then((value) => {
-              if (!value) s.broken.add(key)
-              return value
-            })
-            .catch(() => {
-              s.broken.add(key)
-              return undefined
-            })
+        const current = (attempt: Attempt, key: string) =>
+          !s.disposed && !attempt.retired && s.spawning.get(key) === attempt
 
-          if (!handle) return undefined
-          const client = await LSPClient.create({
-            serverID: server.id,
-            server: handle,
-            root,
-            directory: ctx.directory,
-            instance: ctx,
-          }).catch(async () => {
-            s.broken.add(key)
-            await Process.stop(handle.process)
+        async function schedule(server: LSPServer.Info, root: string, key: string, attempt: Attempt) {
+          let handle: LSPServer.Handle | undefined
+          try {
+            handle = await server.spawn(root, ctx, flags)
+          } catch {
+            if (current(attempt, key)) s.broken.add(key)
             return undefined
-          })
+          }
 
-          if (!client) return undefined
+          if (!current(attempt, key)) {
+            if (handle) await Process.stop(handle.process).catch(() => undefined)
+            return undefined
+          }
+          if (!handle) {
+            s.broken.add(key)
+            return undefined
+          }
+
+          attempt.handle = handle
+          let client: LSPClient.Info
+          try {
+            client = await LSPClient.create({
+              serverID: server.id,
+              server: handle,
+              root,
+              directory: ctx.directory,
+              instance: ctx,
+            })
+          } catch {
+            if (current(attempt, key)) s.broken.add(key)
+            await Process.stop(handle.process).catch(() => undefined)
+            return undefined
+          }
+
+          if (!current(attempt, key)) {
+            await client.shutdown().catch(() => undefined)
+            return undefined
+          }
 
           const existing = s.clients.find((x) => x.root === root && x.serverID === server.id)
           if (existing) {
-            await Process.stop(handle.process)
-            return existing
+            await client.shutdown().catch(() => undefined)
+            return current(attempt, key) ? existing : undefined
           }
 
+          attempt.handle = undefined
           s.clients.push(client)
           return client
         }
@@ -255,44 +293,59 @@ const layer = Layer.effect(
           if (server.extensions.length && !server.extensions.includes(extension)) continue
 
           const root = await server.root(file, ctx)
+          if (s.disposed) return empty
           if (!root) continue
-          if (s.broken.has(root + server.id)) continue
+          const key = keyFor(root, server)
+          if (s.broken.has(key)) continue
 
+          if (s.disposed) return empty
           const match = s.clients.find((x) => x.root === root && x.serverID === server.id)
           if (match) {
+            if (s.disposed) return empty
             result.push(match)
             continue
           }
 
-          const inflight = s.spawning.get(root + server.id)
+          const inflight = s.spawning.get(key)
           if (inflight) {
-            const client = await inflight
+            const client = await inflight.promise
+            if (s.disposed) return empty
             if (!client) continue
             result.push(client)
             continue
           }
 
-          const task = schedule(server, root, root + server.id)
-          s.spawning.set(root + server.id, task)
+          if (s.disposed) return empty
+          const attempt: Attempt = { retired: false }
+          s.spawning.set(key, attempt)
+          const task = schedule(server, root, key, attempt)
+          attempt.promise = task
 
           task.finally(() => {
-            if (s.spawning.get(root + server.id) === task) {
-              s.spawning.delete(root + server.id)
+            if (s.spawning.get(key) === attempt) {
+              s.spawning.delete(key)
             }
           })
 
           const client = await task
+          if (s.disposed) return empty
           if (!client) continue
 
           result.push(client)
-          updated++
+          updated.push(attempt)
         }
 
         return { result, updated }
       })
-      yield* Effect.forEach(Array.from({ length: clients.updated }), () => events.publish(Event.Updated, {}), {
-        discard: true,
-      })
+      if (s.disposed) return []
+      yield* Effect.forEach(
+        clients.updated,
+        (attempt) => (s.disposed || attempt.retired ? Effect.void : events.publish(Event.Updated, {})),
+        {
+          discard: true,
+        },
+      )
+      if (s.disposed) return []
       return clients.result
     })
 
@@ -328,13 +381,16 @@ const layer = Layer.effect(
     const hasClients = Effect.fn("LSP.hasClients")(function* (file: string) {
       const ctx = yield* InstanceState.context
       const s = yield* InstanceState.get(state)
+      if (s.disposed) return false
       return yield* Effect.promise(async () => {
+        if (s.disposed) return false
         const extension = path.parse(file).ext || file
         for (const server of Object.values(s.servers)) {
           if (server.extensions.length && !server.extensions.includes(extension)) continue
           const root = await server.root(file, ctx)
+          if (s.disposed) return false
           if (!root) continue
-          if (s.broken.has(root + server.id)) continue
+          if (s.broken.has(keyFor(root, server))) continue
           return true
         }
         return false
