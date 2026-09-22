@@ -149,7 +149,16 @@ export const {
 
     const fullSyncedSessions = new Set<string>()
     const syncingSessions = new Map<string, Promise<void>>()
+    const resolvingSessions = new Map<string, Promise<void>>()
     const hydratingSessions = new Map<string, { messages: Set<string>; parts: Set<string> }>()
+    const sessionEventRevisions = new Map<string, number>()
+    const sessionStatusRevisions = new Map<string, number>()
+    const permissionRevisions = new Map<string, number>()
+    const questionRevisions = new Map<string, number>()
+    let sessionEventRevision = 0
+    let sessionStatusRevision = 0
+    let permissionRevision = 0
+    let questionRevision = 0
     const touchMessage = (sessionID: string, messageID: string) => {
       hydratingSessions.get(sessionID)?.messages.add(messageID)
     }
@@ -168,9 +177,85 @@ export const {
     }
 
     function listSessions() {
+      const revisions = new Map(sessionEventRevisions)
       return sdk.client.session
         .list({ start: Date.now() - 30 * 24 * 60 * 60 * 1000, ...sessionListQuery() })
-        .then((x) => (x.data ?? []).toSorted((a, b) => a.id.localeCompare(b.id)))
+        .then((x) => ({ revisions, sessions: (x.data ?? []).toSorted((a, b) => a.id.localeCompare(b.id)) }))
+    }
+
+    function applySessionList(result: { revisions: Map<string, number>; sessions: Session[] }) {
+      const current = new Map(store.session.map((session) => [session.id, session] as const))
+      const listed = new Set(result.sessions.map((session) => session.id))
+      const sessions = result.sessions.flatMap((session) => {
+        if (sessionEventRevisions.get(session.id) === result.revisions.get(session.id)) return [session]
+        const live = current.get(session.id)
+        return live ? [live] : []
+      })
+      sessions.push(
+        ...store.session.filter(
+          (session) =>
+            !listed.has(session.id) && sessionEventRevisions.get(session.id) !== result.revisions.get(session.id),
+        ),
+      )
+      setStore("session", reconcile(sessions.toSorted((a, b) => a.id.localeCompare(b.id))))
+    }
+
+    function markSessionEvent(sessionID: string) {
+      sessionEventRevision++
+      sessionEventRevisions.set(sessionID, sessionEventRevision)
+    }
+
+    function markSessionStatusEvent(sessionID: string) {
+      sessionStatusRevision++
+      sessionStatusRevisions.set(sessionID, sessionStatusRevision)
+    }
+
+    function markPermissionEvent(sessionID: string) {
+      permissionRevision++
+      permissionRevisions.set(sessionID, permissionRevision)
+    }
+
+    function markQuestionEvent(sessionID: string) {
+      questionRevision++
+      questionRevisions.set(sessionID, questionRevision)
+    }
+
+    function rememberSession(session: Session) {
+      markSessionEvent(session.id)
+      const result = search(store.session, session.id, (item) => item.id)
+      if (result.found) {
+        setStore("session", result.index, reconcile(session))
+        return
+      }
+      setStore(
+        "session",
+        produce((draft) => {
+          draft.splice(result.index, 0, session)
+        }),
+      )
+    }
+
+    function resolveSession(sessionID: string, location?: { directory?: string; workspace?: string }) {
+      if (search(store.session, sessionID, (session) => session.id).found) return Promise.resolve()
+      const active = resolvingSessions.get(sessionID)
+      if (active) return active
+      const revision = sessionEventRevisions.get(sessionID)
+      const task = sdk.client.session
+        .get({ sessionID, ...location }, { throwOnError: true })
+        .then((response) => {
+          if (!response.data) return
+          if (sessionEventRevisions.get(sessionID) !== revision) return
+          rememberSession(response.data)
+          if (response.data.parentID) {
+            void resolveSession(response.data.parentID, {
+              directory: response.data.directory,
+              workspace: response.data.workspaceID,
+            }).catch(() => {})
+          }
+        })
+        .finally(() => resolvingSessions.delete(sessionID))
+      resolvingSessions.set(sessionID, task)
+      return task
     }
 
     event.subscribe((event, { directory, workspace }) => {
@@ -179,6 +264,7 @@ export const {
           void bootstrap()
           break
         case "permission.replied": {
+          markPermissionEvent(event.properties.sessionID)
           const requests = store.permission[event.properties.sessionID]
           if (!requests) break
           const match = search(requests, event.properties.requestID, (r) => r.id)
@@ -195,6 +281,8 @@ export const {
 
         case "permission.asked": {
           const request = event.properties
+          markPermissionEvent(request.sessionID)
+          void resolveSession(request.sessionID, { directory, workspace }).catch(() => {})
           if (permission.mode === "auto") {
             void sdk.client.permission.reply({
               requestID: request.id,
@@ -226,6 +314,7 @@ export const {
 
         case "question.replied":
         case "question.rejected": {
+          markQuestionEvent(event.properties.sessionID)
           const requests = store.question[event.properties.sessionID]
           if (!requests) break
           const match = search(requests, event.properties.requestID, (r) => r.id)
@@ -242,6 +331,8 @@ export const {
 
         case "question.asked": {
           const request = event.properties
+          markQuestionEvent(request.sessionID)
+          void resolveSession(request.sessionID, { directory, workspace }).catch(() => {})
           const requests = store.question[request.sessionID]
           if (!requests) {
             setStore("question", request.sessionID, [request])
@@ -271,6 +362,7 @@ export const {
           break
 
         case "session.deleted": {
+          markSessionEvent(event.properties.info.id)
           const result = search(store.session, event.properties.info.id, (s) => s.id)
           if (result.found) {
             setStore(
@@ -282,24 +374,16 @@ export const {
           }
           break
         }
+        case "session.created":
         case "session.updated": {
-          const result = search(store.session, event.properties.info.id, (s) => s.id)
-          if (result.found) {
-            setStore("session", result.index, reconcile(event.properties.info))
-            break
-          }
-          setStore(
-            "session",
-            produce((draft) => {
-              draft.splice(result.index, 0, event.properties.info)
-            }),
-          )
+          rememberSession(event.properties.info)
           break
         }
 
         case "session.next.moved": {
           const result = search(store.session, event.properties.sessionID, (s) => s.id)
           if (!result.found) break
+          markSessionEvent(event.properties.sessionID)
           setStore(
             "session",
             result.index,
@@ -314,7 +398,9 @@ export const {
         }
 
         case "session.status": {
+          markSessionStatusEvent(event.properties.sessionID)
           setStore("session_status", event.properties.sessionID, event.properties.status)
+          void resolveSession(event.properties.sessionID, { directory, workspace }).catch(() => {})
           break
         }
 
@@ -448,6 +534,63 @@ export const {
     const exit = useExit()
     const args = useArgs()
 
+    async function loadSessionStatuses(workspace: string | undefined) {
+      const revisions = new Map(sessionStatusRevisions)
+      const response = await sdk.client.session.status({ workspace })
+      for (const sessionID of Object.keys(response.data ?? {})) void resolveSession(sessionID, { workspace }).catch(() => {})
+      setStore(
+        "session_status",
+        produce((draft) => {
+          for (const [sessionID, status] of Object.entries(response.data ?? {})) {
+            if (sessionStatusRevisions.get(sessionID) !== revisions.get(sessionID)) continue
+            draft[sessionID] = status
+          }
+        }),
+      )
+    }
+
+    async function loadPermissions(workspace: string | undefined) {
+      const revisions = new Map(permissionRevisions)
+      const response = await sdk.client.permission.list({ workspace })
+      for (const request of response.data ?? []) void resolveSession(request.sessionID, { workspace }).catch(() => {})
+      const pending = (response.data ?? []).reduce<Record<string, PermissionRequest[]>>((result, request) => {
+        const requests = result[request.sessionID] ?? []
+        requests.push(request)
+        result[request.sessionID] = requests
+        return result
+      }, {})
+      setStore(
+        "permission",
+        produce((draft) => {
+          for (const sessionID of new Set([...Object.keys(draft), ...Object.keys(pending)])) {
+            if (permissionRevisions.get(sessionID) !== revisions.get(sessionID)) continue
+            draft[sessionID] = pending[sessionID] ?? []
+          }
+        }),
+      )
+    }
+
+    async function loadQuestions(workspace: string | undefined) {
+      const revisions = new Map(questionRevisions)
+      const response = await sdk.client.question.list({ workspace })
+      for (const request of response.data ?? []) void resolveSession(request.sessionID, { workspace }).catch(() => {})
+      const pending = (response.data ?? []).reduce<Record<string, QuestionRequest[]>>((result, request) => {
+        const requests = result[request.sessionID] ?? []
+        requests.push(request)
+        result[request.sessionID] = requests
+        return result
+      }, {})
+      setStore(
+        "question",
+        produce((draft) => {
+          for (const sessionID of new Set([...Object.keys(draft), ...Object.keys(pending)])) {
+            if (questionRevisions.get(sessionID) !== revisions.get(sessionID)) continue
+            draft[sessionID] = pending[sessionID] ?? []
+          }
+        }),
+      )
+    }
+
     async function bootstrap(input: { fatal?: boolean } = {}) {
       const fatal = input.fatal ?? true
       const workspace = project.workspace.current()
@@ -510,7 +653,7 @@ export const {
               setStore("console_state", reconcile(consoleState))
               setStore("agent", reconcile(agents))
               setStore("config", reconcile(config))
-              if (sessions !== undefined) setStore("session", reconcile(sessions))
+              if (sessions !== undefined) applySessionList(sessions)
             })
           })
         })
@@ -518,7 +661,7 @@ export const {
           if (store.status !== "complete") setStore("status", "partial")
           // non-blocking
           void Promise.all([
-            ...(args.continue ? [] : [sessionListPromise.then((sessions) => setStore("session", reconcile(sessions)))]),
+            ...(args.continue ? [] : [sessionListPromise.then((sessions) => applySessionList(sessions))]),
             consoleStatePromise.then((consoleState) => setStore("console_state", reconcile(consoleState))),
             sdk.client.command.list({ workspace }).then((x) => setStore("command", reconcile(x.data ?? []))),
             sdk.client.lsp.status({ workspace }).then((x) => setStore("lsp", reconcile(x.data ?? []))),
@@ -527,9 +670,9 @@ export const {
               .list({ workspace })
               .then((x) => setStore("mcp_resource", reconcile(x.data ?? {}))),
             sdk.client.formatter.status({ workspace }).then((x) => setStore("formatter", reconcile(x.data ?? []))),
-            sdk.client.session.status({ workspace }).then((x) => {
-              setStore("session_status", reconcile(x.data ?? {}))
-            }),
+            loadSessionStatuses(workspace),
+            loadPermissions(workspace),
+            loadQuestions(workspace),
             sdk.client.provider.auth({ workspace }).then((x) => setStore("provider_auth", reconcile(x.data ?? {}))),
             sdk.client.vcs.get({ workspace }).then((x) => setStore("vcs", reconcile(x.data))),
             project.workspace.sync(),
@@ -579,7 +722,7 @@ export const {
         },
         async refresh() {
           const list = await listSessions()
-          setStore("session", reconcile(list))
+          applySessionList(list)
         },
         status(sessionID: string) {
           const session = result.session.get(sessionID)

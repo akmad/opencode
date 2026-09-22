@@ -283,3 +283,221 @@ test("a message removed during hydration does not regain stale parts", async () 
     app.renderer.destroy()
   }
 })
+
+test("a child session created event updates metadata without hydrating the session", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+
+  const childSessionID = "ses_hydration_child"
+  const childSession = {
+    ...session,
+    id: childSessionID,
+    parentID: sessionID,
+    title: "child",
+    slug: "child",
+    projectID: "proj_test",
+  }
+  let childSessionRequests = 0
+  const { app, emit, sync } = await mount((url) => {
+    if (url.pathname === `/session/${childSessionID}`) {
+      childSessionRequests++
+      return json(childSession)
+    }
+    return undefined
+  }, tmp.path)
+
+  try {
+    emit(global({ id: "evt_session", type: "session.created", properties: { sessionID: childSessionID, info: childSession } }))
+
+    expect(sync.session.get(childSessionID)).toEqual(childSession)
+    expect(childSessionRequests).toBe(0)
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("an unknown child status event hydrates session metadata", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+
+  const childSessionID = "ses_hydration_status_child"
+  const childSession = {
+    ...session,
+    id: childSessionID,
+    parentID: sessionID,
+    title: "child",
+    slug: "child",
+    projectID: "proj_test",
+  }
+  let childSessionRequests = 0
+  const { app, emit, sync } = await mount((url) => {
+    if (url.pathname === `/session/${childSessionID}`) {
+      childSessionRequests++
+      return json(childSession)
+    }
+    return undefined
+  }, tmp.path)
+
+  try {
+    emit(global({ id: "evt_status", type: "session.status", properties: { sessionID: childSessionID, status: { type: "busy" } } }))
+
+    await wait(() => sync.session.get(childSessionID)?.parentID === sessionID)
+    expect(childSessionRequests).toBe(1)
+    expect(sync.data.session_status[childSessionID]).toEqual({ type: "busy" })
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("session status bootstrap resolves an unvisited child session", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+
+  const childSessionID = "ses_hydration_bootstrap_status_child"
+  const childSession = {
+    ...session,
+    id: childSessionID,
+    parentID: sessionID,
+    title: "child",
+    slug: "child",
+    projectID: "proj_test",
+  }
+  const status = { type: "busy" as const }
+  const { app, sync } = await mount((url) => {
+    if (url.pathname === "/session/status") return json({ [childSessionID]: status })
+    if (url.pathname === `/session/${childSessionID}`) return json(childSession)
+    return undefined
+  }, tmp.path)
+
+  try {
+    await wait(() => sync.session.get(childSessionID)?.parentID === sessionID)
+
+    expect(sync.data.session_status[childSessionID]).toEqual(status)
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("permission bootstrap resolves an unvisited child session", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+
+  const childSessionID = "ses_hydration_bootstrap_permission_child"
+  const childSession = {
+    ...session,
+    id: childSessionID,
+    parentID: sessionID,
+    title: "child",
+    slug: "child",
+    projectID: "proj_test",
+  }
+  const request = {
+    id: "perm_hydration_bootstrap_child",
+    sessionID: childSessionID,
+    permission: "edit",
+    patterns: [],
+    metadata: {},
+    always: [],
+  }
+  const { app, sync } = await mount((url) => {
+    if (url.pathname === "/permission") return json([request])
+    if (url.pathname === `/session/${childSessionID}`) return json(childSession)
+    return undefined
+  }, tmp.path)
+
+  try {
+    await wait(() => sync.session.get(childSessionID)?.parentID === sessionID)
+
+    expect(sync.data.permission[childSessionID]).toEqual([request])
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("question bootstrap resolves an unvisited child session", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+
+  const childSessionID = "ses_hydration_bootstrap_question_child"
+  const childSession = {
+    ...session,
+    id: childSessionID,
+    parentID: sessionID,
+    title: "child",
+    slug: "child",
+    projectID: "proj_test",
+  }
+  const request = { id: "question_hydration_bootstrap_child", sessionID: childSessionID, questions: [] }
+  const { app, sync } = await mount((url) => {
+    if (url.pathname === "/question") return json([request])
+    if (url.pathname === `/session/${childSessionID}`) return json(childSession)
+    return undefined
+  }, tmp.path)
+
+  try {
+    await wait(() => sync.session.get(childSessionID)?.parentID === sessionID)
+
+    expect(sync.data.question[childSessionID]).toEqual([request])
+  } finally {
+    app.renderer.destroy()
+  }
+})
+
+test("a live child session survives a stale initial session list", async () => {
+  await using tmp = await tmpdir()
+  await Bun.write(`${tmp.path}/kv.json`, "{}")
+
+  const childSessionID = "ses_hydration_child_stale_list"
+  const childSession = {
+    ...session,
+    id: childSessionID,
+    parentID: sessionID,
+    title: "child",
+    slug: "child-stale-list",
+    projectID: "proj_test",
+  }
+  const rootSession = {
+    ...session,
+    id: "ses_hydration_root",
+    title: "root",
+    slug: "root",
+    projectID: "proj_test",
+  }
+  let resolveSessions!: (response: Response) => void
+  const sessions = new Promise<Response>((resolve) => {
+    resolveSessions = resolve
+  })
+  let sessionListRequested = false
+  let childSessionRequests = 0
+  const { app, emit, sync } = await mount(
+    (url) => {
+      if (url.pathname === "/session") {
+        sessionListRequested = true
+        return sessions
+      }
+      if (url.pathname === `/session/${childSessionID}`) {
+        childSessionRequests++
+        return json(childSession)
+      }
+      return undefined
+    },
+    tmp.path,
+    { waitForReady: false },
+  )
+
+  try {
+    await wait(() => sessionListRequested)
+    emit(global({ id: "evt_session", type: "session.created", properties: { sessionID: childSessionID, info: childSession } }))
+    expect(sync.session.get(childSessionID)).toEqual(childSession)
+
+    resolveSessions(json([rootSession]))
+    await wait(() => sync.status === "complete")
+
+    expect(sync.session.get(childSessionID)).toEqual(childSession)
+    expect(sync.session.get(rootSession.id)).toEqual(rootSession)
+    expect(sync.data.session.map((item) => item.id)).toEqual([childSessionID, rootSession.id])
+    expect(childSessionRequests).toBe(0)
+  } finally {
+    app.renderer.destroy()
+  }
+})
