@@ -75,6 +75,9 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   lsp: ConfigLSP.Info.pipe(Schema.optional).annotate({
     description: "Enable built-in language servers or configure server overrides",
   }),
+  lsp_limits: ConfigLSP.Limits.pipe(Schema.optional).annotate({
+    description: "Bounds on concurrent and idle language server clients",
+  }),
   attachments: ConfigAttachments.Info.pipe(Schema.optional).annotate({
     description: "Attachment processing configuration",
   }),

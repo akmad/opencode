@@ -121,6 +121,20 @@ export const Info = Schema.Struct({
     description:
       "Enable or configure LSP servers. Omit or set to false to disable, true to enable built-ins, or an object to enable built-ins with overrides.",
   }),
+  lsp_limits: Schema.optional(
+    Schema.Struct({
+      idle_timeout: Schema.optional(NonNegativeInt).annotate({
+        description:
+          "Milliseconds a language server root may go unused before it is retired (default: 600000, 10 minutes). Set to 0 to disable idle eviction.",
+      }),
+      max_concurrent: Schema.optional(PositiveInt).annotate({
+        description:
+          "Maximum number of live language server clients per server id. When a new root would exceed this, the least-recently-used root for that server id is retired first (default: 4).",
+      }),
+    }),
+  ).annotate({
+    description: "Bounds on concurrent and idle language server clients",
+  }),
   instructions: Schema.optional(Schema.mutable(Schema.Array(Schema.String))).annotate({
     description: "Additional instruction files or patterns to include",
   }),
