@@ -110,6 +110,12 @@ const filterExperimentalServers = (servers: Record<string, LSPServer.Info>, flag
 
 type LocInput = { file: string; line: number; character: number }
 
+// A root goes unused for this long before the periodic sweep retires it.
+const DEFAULT_LSP_IDLE_TIMEOUT_MS = 10 * 60 * 1000
+// At most this many live clients per server id; creating one more evicts the
+// least-recently-used root for that same server id first.
+const DEFAULT_LSP_MAX_CONCURRENT_PER_SERVER = 4
+
 interface State {
   clients: LSPClient.Info[]
   servers: Record<string, LSPServer.Info>
@@ -118,6 +124,8 @@ interface State {
   cleanupFailures: unknown[]
   report: (message: string, error: unknown) => void
   disposed: boolean
+  idleTimeoutMs: number
+  maxConcurrentPerServer: number
 }
 
 interface Attempt {
@@ -141,6 +149,11 @@ interface RootRecord {
   client?: LSPClient.Info
   clientAttempt?: Attempt
   retirement?: Promise<void>
+  // Wall-clock time (ms) a client for this root last served a request for a
+  // specific file. Refreshed only on paths that hand this root's client to a
+  // caller, never on lookups that merely check for one and never on broadcasts
+  // over every client (see `runAll`).
+  lastUsed: number
 }
 
 interface RootIdentity {
@@ -265,6 +278,15 @@ async function waitForRetirements(state: State, remaining: Promise<void>[] = [])
   if (failures.length) throw new AggregateError(failures, "Failed to retire LSP roots")
 }
 
+// A record is only a live client, never mid-handshake, once it holds a
+// client and its spawn/init attempt has cleared. Idle and capacity eviction
+// must both use this so a root that is still initializing can never be
+// retired for either reason.
+const isLiveClient = (record: RootRecord) => !!record.client && !record.attempt
+
+const isIdle = (state: State, record: RootRecord, now: number) =>
+  state.idleTimeoutMs > 0 && isLiveClient(record) && now - record.lastUsed >= state.idleTimeoutMs
+
 async function reconcileRoots(state: State) {
   let updated = false
   for (const record of [...state.roots.values()]) {
@@ -272,12 +294,31 @@ async function reconcileRoots(state: State) {
     const observed = await rootIdentity(record.root)
     if (state.roots.get(record.key) !== record) continue
     if (observed._tag === "uncertain") continue
-    if (observed._tag === "present" && !rootChanged(record.identity, observed.identity)) continue
+    if (observed._tag === "present" && !rootChanged(record.identity, observed.identity)) {
+      if (isIdle(state, record, Date.now())) {
+        retire(state, record)
+        updated = true
+      }
+      continue
+    }
     retire(state, record)
     updated = true
   }
   await waitForRetirements(state)
   return updated
+}
+
+// Retires the least-recently-used live client for `server.id` until adding
+// one more client would stay within the configured cap. Only ever considers
+// fully-established clients (see `isLiveClient`), so a root mid-handshake is
+// never a candidate.
+function evictForCapacity(state: State, server: LSPServer.Info) {
+  const cap = state.maxConcurrentPerServer
+  if (!(cap > 0)) return
+  const live = [...state.roots.values()].filter((record) => record.server.id === server.id && isLiveClient(record))
+  if (live.length < cap) return
+  live.sort((a, b) => a.lastUsed - b.lastUsed)
+  for (let i = 0; i < live.length - cap + 1; i++) retire(state, live[i])
 }
 
 export interface Interface {
@@ -360,6 +401,8 @@ const layer = Layer.effect(
           cleanupFailures: [],
           report: (message, error) => Effect.runFork(Effect.logError(message, { cause: error })),
           disposed: false,
+          idleTimeoutMs: cfg.lsp_limits?.idle_timeout ?? DEFAULT_LSP_IDLE_TIMEOUT_MS,
+          maxConcurrentPerServer: cfg.lsp_limits?.max_concurrent ?? DEFAULT_LSP_MAX_CONCURRENT_PER_SERVER,
         }
 
         yield* Effect.addFinalizer(() =>
@@ -501,6 +544,7 @@ const layer = Layer.effect(
                 identity: observed.identity,
                 broken: false,
                 stale: false,
+                lastUsed: Date.now(),
               }
               if (!s.roots.has(key)) s.roots.set(key, replacement)
               record = s.roots.get(key)
@@ -508,6 +552,7 @@ const layer = Layer.effect(
             if (!record || record.broken) break
 
             if (record.client) {
+              record.lastUsed = Date.now()
               result.push(record.client)
               break
             }
@@ -521,11 +566,13 @@ const layer = Layer.effect(
                 continue
               }
               if (!currentClient(s, record, attempt, client)) continue
+              record.lastUsed = Date.now()
               result.push(client)
               break
             }
 
             if (s.disposed) return empty
+            evictForCapacity(s, server)
             let cancel!: () => void
             const attempt: Attempt = {
               retired: false,
@@ -557,6 +604,7 @@ const layer = Layer.effect(
               continue
             }
             if (!currentClient(s, record, attempt, client)) continue
+            record.lastUsed = Date.now()
             result.push(client)
             updated = true
             break
@@ -576,6 +624,12 @@ const layer = Layer.effect(
       return yield* Effect.promise(() => Promise.all(clients.map((x) => fn(x))))
     })
 
+    // Deliberately does NOT refresh `lastUsed`. A broadcast over every client
+    // means someone asked a global question (collect all diagnostics, search
+    // every workspace symbol), not that any particular root is in use. Counting
+    // it would reset all roots' timers together on routine post-edit calls, so
+    // idle eviction could never fire, and it would flatten every timestamp to
+    // the same value and destroy the LRU ordering the capacity cap sorts on.
     const runAll = Effect.fnUntraced(function* <T>(fn: (client: LSPClient.Info) => Promise<T>) {
       const s = yield* InstanceState.get(state)
       return yield* Effect.promise(() => Promise.all(s.clients.map((x) => fn(x))))
