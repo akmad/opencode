@@ -17,6 +17,15 @@ const onUnhandledRejection = (_error: unknown) => {}
 
 const onUncaughtException = (_error: Error) => {}
 
+// The worker shares the TUI's stderr, so the default warning printer (e.g. the
+// NODE_TLS_REJECT_UNAUTHORIZED notice on first HTTPS request) paints over the
+// rendered screen. Route process warnings to the log file instead.
+const onWarning = (warning: Error) => {
+  AppRuntime.runFork(Effect.logWarning(warning.message, { name: warning.name }))
+}
+
+process.removeAllListeners("warning")
+process.on("warning", onWarning)
 process.on("unhandledRejection", onUnhandledRejection)
 process.on("uncaughtException", onUncaughtException)
 
@@ -74,6 +83,7 @@ export const rpc = {
     if (server) await server.stop(true)
     process.off("unhandledRejection", onUnhandledRejection)
     process.off("uncaughtException", onUncaughtException)
+    process.off("warning", onWarning)
   },
 }
 
